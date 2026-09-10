@@ -2,132 +2,388 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Headers
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_URL = "https://coinmarketcap.com/?page={}"
+
+OUTPUT_CSV = "crypto_Analysis_Data_Task5.csv"
+OUTPUT_XLSX = "crypto_Analysis_Data_Task5.xlsx"
+
+TOTAL_PAGES = 20
+
+
+# ============================================================
+# REQUEST SESSION WITH RETRIES
+# ============================================================
+
+session = requests.Session()
+
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
 headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537.36"
+    )
 }
 
-# Function to convert K, M, B, T values into numbers
-def convert_number(value):
 
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def convert_number(value):
+    """
+    Convert values such as:
+    1.5K -> 1500
+    2.3M -> 2300000
+    4.2B -> 4200000000
+    1.1T -> 1100000000000
+    """
     if value is None:
         return None
 
-    value = value.replace("$", "").replace(",", "").strip()
+    value = value.strip().replace(",", "").replace("$", "")
 
-    if value == "":
+    if value in {"", "-", "N/A"}:
         return None
 
     try:
-        if value.endswith("K"):
-            return float(value[:-1]) * 1_000
+        multiplier = 1
 
-        elif value.endswith("M"):
-            return float(value[:-1]) * 1_000_000
+        if value[-1].upper() == "K":
+            multiplier = 1_000
+            value = value[:-1]
 
-        elif value.endswith("B"):
-            return float(value[:-1]) * 1_000_000_000
+        elif value[-1].upper() == "M":
+            multiplier = 1_000_000
+            value = value[:-1]
 
-        elif value.endswith("T"):
-            return float(value[:-1]) * 1_000_000_000_000
+        elif value[-1].upper() == "B":
+            multiplier = 1_000_000_000
+            value = value[:-1]
 
-        else:
-            return float(value)
+        elif value[-1].upper() == "T":
+            multiplier = 1_000_000_000_000
+            value = value[:-1]
 
-    except:
+        return float(value) * multiplier
+
+    except ValueError:
         return None
 
 
-crypto_data = []
+def convert_price(value):
+    """
+    Convert cryptocurrency price text to float.
+    Handles $, commas and very small decimal values.
+    """
+    if value is None:
+        return None
 
-# Scrape first 20 pages
-for page in range(1, 21):
+    value = value.strip().replace("$", "").replace(",", "")
 
-    print(f"\nScraping Page {page}...")
+    if value in {"", "-", "N/A"}:
+        return None
 
-    url = f"https://coinmarketcap.com/?page={page}"
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
-    response = requests.get(url, headers=headers)
 
-    print("Status Code:", response.status_code)
+def convert_percentage(value):
+    """
+    Convert percentage text such as:
+    5.57% -> 5.57
+    -2.31% -> -2.31
+    """
+    if value is None:
+        return None
 
-    soup = BeautifulSoup(response.content, "html.parser")
+    value = value.strip().replace("%", "").replace(",", "")
+
+    if value in {"", "-", "N/A"}:
+        return None
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+# ============================================================
+# SCRAPING
+# ============================================================
+
+all_data = []
+seen_coins = set()
+
+for page in range(1, TOTAL_PAGES + 1):
+
+    url = BASE_URL.format(page)
+
+    print(f"Scraping page {page}/{TOTAL_PAGES}...")
+
+    try:
+        response = session.get(
+            url,
+            headers=headers,
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as e:
+        print(f"Error loading page {page}: {e}")
+        continue
+
+    soup = BeautifulSoup(response.text, "html.parser")
 
     rows = soup.find_all("tr")
 
-    print("Total <tr> tags:", len(rows))
-
-    records_on_page = 0
+    page_count = 0
 
     for row in rows:
 
         tds = row.find_all("td")
 
+        # Skip rows that do not contain coin information
         if len(tds) < 10:
             continue
 
-        # Coin Name
-        name_tag = tds[2].find("p", class_="coin-item-name")
+        try:
 
-        if not name_tag:
+            # ------------------------------------------------
+            # COIN NAME
+            # ------------------------------------------------
+            name_tag = tds[2].find(
+                ["p", "a", "span"]
+            )
+
+            if name_tag:
+                coin_name = name_tag.get_text(strip=True)
+            else:
+                coin_name = tds[2].get_text(strip=True)
+
+            # Skip blank names
+            if not coin_name:
+                continue
+
+            # Remove duplicates
+            if coin_name in seen_coins:
+                continue
+
+            # ------------------------------------------------
+            # SYMBOL
+            # ------------------------------------------------
+            symbol = ""
+
+            # Try common symbol elements
+            symbol_tag = row.find(
+                "p",
+                class_=lambda x: x and "coin-item-symbol" in x
+            )
+
+            if symbol_tag:
+                symbol = symbol_tag.get_text(strip=True)
+
+            # Fallback
+            if not symbol:
+                texts = tds[2].stripped_strings
+                texts = list(texts)
+
+                if len(texts) > 1:
+                    symbol = texts[-1]
+
+            # ------------------------------------------------
+            # PRICE
+            # ------------------------------------------------
+            price = convert_price(
+                tds[3].get_text(strip=True)
+            )
+
+            # ------------------------------------------------
+            # 1H CHANGE
+            # ------------------------------------------------
+            change_1h = convert_percentage(
+                tds[4].get_text(strip=True)
+            )
+
+            # ------------------------------------------------
+            # 24H CHANGE
+            # ------------------------------------------------
+            change_24h = convert_percentage(
+                tds[5].get_text(strip=True)
+            )
+
+            # ------------------------------------------------
+            # 7D CHANGE
+            # ------------------------------------------------
+            change_7d = convert_percentage(
+                tds[6].get_text(strip=True)
+            )
+
+            # ------------------------------------------------
+            # MARKET CAP
+            # ------------------------------------------------
+            market_cap = convert_number(
+                tds[7].get_text(strip=True)
+            )
+
+            # ------------------------------------------------
+            # VOLUME 24H
+            # ------------------------------------------------
+            volume_24h = convert_number(
+                tds[8].get_text(strip=True)
+            )
+
+            # ------------------------------------------------
+            # CIRCULATING SUPPLY
+            # ------------------------------------------------
+            supply_text = tds[9].get_text(strip=True)
+
+            circulating_supply = convert_number(
+                supply_text.split()[0]
+            )
+
+            # ------------------------------------------------
+            # STORE RECORD
+            # ------------------------------------------------
+            record = {
+                "Coin Name": coin_name,
+                "Symbol": symbol,
+                "Price (USD)": price,
+                "1h Change (%)": change_1h,
+                "24h Change (%)": change_24h,
+                "7d Change (%)": change_7d,
+                "Market Cap": market_cap,
+                "Volume (24h)": volume_24h,
+                "Circulating Supply": circulating_supply
+            }
+
+            all_data.append(record)
+            seen_coins.add(coin_name)
+
+            page_count += 1
+
+        except Exception as e:
+            print(
+                f"Skipping a row on page {page}: {e}"
+            )
             continue
 
-        # Symbol
-        symbol_tag = tds[2].find("p", class_="coin-item-symbol")
+    print(
+        f"Page {page}: {page_count} new coins collected"
+    )
 
-        data = {}
-
-        data["Coin Name"] = name_tag.get_text(strip=True)
-        data["Symbol"] = symbol_tag.get_text(strip=True) if symbol_tag else "N/A"
-
-        # Price
-        price = tds[3].get_text(strip=True)
-        data["Price (USD)"] = convert_number(price)
-
-        # 1 Hour Change
-        change = tds[4].get_text(strip=True).replace("%", "")
-
-        try:
-            data["1h Change (%)"] = float(change)
-        except:
-            data["1h Change (%)"] = None
-
-        # Market Cap
-        market_cap = tds[7].get_text(" ", strip=True)
-        data["Market Cap"] = convert_number(market_cap)
-
-        # Volume
-        volume = tds[8].get_text(" ", strip=True)
-        data["Volume (24h)"] = convert_number(volume)
-
-        # Circulating Supply
-        supply = tds[9].get_text(" ", strip=True)
-
-        supply = supply.replace(data["Symbol"], "").strip()
-
-        data["Circulating Supply"] = convert_number(supply)
-
-        crypto_data.append(data)
-
-        records_on_page += 1
-
-    print(f"Records Found: {records_on_page}")
-
-    time.sleep(2)
+    # Small delay between requests
+    time.sleep(1)
 
 
-print("\nTotal Records Collected:", len(crypto_data))
+# ============================================================
+# CREATE DATAFRAME
+# ============================================================
 
-# Create DataFrame
-df = pd.DataFrame(crypto_data)
+df = pd.DataFrame(all_data)
 
-# Display first five rows
+# Remove duplicate coins if any
+df = df.drop_duplicates(
+    subset=["Coin Name"]
+).reset_index(drop=True)
+
+
+# ============================================================
+# DISPLAY SUMMARY
+# ============================================================
+
+print("\n========================================")
+print("SCRAPING COMPLETED")
+print("========================================")
+
+print(f"Total coins collected: {len(df)}")
+
+print("\nColumns:")
+print(df.columns.tolist())
+
+print("\nFirst 5 rows:")
 print(df.head())
 
-# Save files
-df.to_csv("crypto_Analysis_Data.csv", index=False)
 
-df.to_excel("crypto_Analysis_Data.xlsx", index=False)
+# ============================================================
+# SAVE CSV
+# ============================================================
 
-print("\nData saved successfully!")
+df.to_csv(
+    OUTPUT_CSV,
+    index=False
+)
+
+print(f"\nCSV saved as: {OUTPUT_CSV}")
+
+
+# ============================================================
+# SAVE EXCEL
+# ============================================================
+
+df.to_excel(
+    OUTPUT_XLSX,
+    index=False
+)
+
+print(f"Excel saved as: {OUTPUT_XLSX}")
+
+
+# ============================================================
+# FINAL VALIDATION
+# ============================================================
+
+required_columns = [
+    "Coin Name",
+    "Symbol",
+    "Price (USD)",
+    "1h Change (%)",
+    "24h Change (%)",
+    "7d Change (%)",
+    "Market Cap",
+    "Volume (24h)",
+    "Circulating Supply"
+]
+
+missing_columns = [
+    col for col in required_columns
+    if col not in df.columns
+]
+
+if missing_columns:
+    print(
+        "\nWARNING: Missing columns:",
+        missing_columns
+    )
+else:
+    print(
+        "\nAll required columns are present."
+    )
+
+print("\nMissing values:")
+print(df[required_columns].isnull().sum())
+
+print("\n========================================")
+print("DONE")
+print("========================================")
