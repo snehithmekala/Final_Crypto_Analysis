@@ -1,0 +1,133 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+
+# Headers
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+}
+
+# Function to convert K, M, B, T values into numbers
+def convert_number(value):
+
+    if value is None:
+        return None
+
+    value = value.replace("$", "").replace(",", "").strip()
+
+    if value == "":
+        return None
+
+    try:
+        if value.endswith("K"):
+            return float(value[:-1]) * 1_000
+
+        elif value.endswith("M"):
+            return float(value[:-1]) * 1_000_000
+
+        elif value.endswith("B"):
+            return float(value[:-1]) * 1_000_000_000
+
+        elif value.endswith("T"):
+            return float(value[:-1]) * 1_000_000_000_000
+
+        else:
+            return float(value)
+
+    except:
+        return None
+
+
+crypto_data = []
+
+# Scrape first 20 pages
+for page in range(1, 21):
+
+    print(f"\nScraping Page {page}...")
+
+    url = f"https://coinmarketcap.com/?page={page}"
+
+    response = requests.get(url, headers=headers)
+
+    print("Status Code:", response.status_code)
+
+    soup = BeautifulSoup(response.content, "html.parser")
+
+    rows = soup.find_all("tr")
+
+    print("Total <tr> tags:", len(rows))
+
+    records_on_page = 0
+
+    for row in rows:
+
+        tds = row.find_all("td")
+
+        if len(tds) < 10:
+            continue
+
+        # Coin Name
+        name_tag = tds[2].find("p", class_="coin-item-name")
+
+        if not name_tag:
+            continue
+
+        # Symbol
+        symbol_tag = tds[2].find("p", class_="coin-item-symbol")
+
+        data = {}
+
+        data["Coin Name"] = name_tag.get_text(strip=True)
+        data["Symbol"] = symbol_tag.get_text(strip=True) if symbol_tag else "N/A"
+
+        # Price
+        price = tds[3].get_text(strip=True)
+        data["Price (USD)"] = convert_number(price)
+
+        # 1 Hour Change
+        change = tds[4].get_text(strip=True).replace("%", "")
+
+        try:
+            data["1h Change (%)"] = float(change)
+        except:
+            data["1h Change (%)"] = None
+
+        # Market Cap
+        market_cap = tds[7].get_text(" ", strip=True)
+        data["Market Cap"] = convert_number(market_cap)
+
+        # Volume
+        volume = tds[8].get_text(" ", strip=True)
+        data["Volume (24h)"] = convert_number(volume)
+
+        # Circulating Supply
+        supply = tds[9].get_text(" ", strip=True)
+
+        supply = supply.replace(data["Symbol"], "").strip()
+
+        data["Circulating Supply"] = convert_number(supply)
+
+        crypto_data.append(data)
+
+        records_on_page += 1
+
+    print(f"Records Found: {records_on_page}")
+
+    time.sleep(2)
+
+
+print("\nTotal Records Collected:", len(crypto_data))
+
+# Create DataFrame
+df = pd.DataFrame(crypto_data)
+
+# Display first five rows
+print(df.head())
+
+# Save files
+df.to_csv("crypto_Analysis_Data.csv", index=False)
+
+df.to_excel("crypto_Analysis_Data.xlsx", index=False)
+
+print("\nData saved successfully!")
